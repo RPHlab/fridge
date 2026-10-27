@@ -379,9 +379,15 @@ def overview_chart(df):
 st.title("🌡️ ระบบบันทึกอุณหภูมิตู้เย็นและเช็คลิสต์")
 st.caption("โรงพยาบาลราชพฤกษ์ · FM-LAB-117 / 118 / 119 Rev.00")
 
-# ตู้ที่เลือก (selectbox อยู่บนสุดของหน้า แต่ค่าถูกอ่านจาก session_state ก่อนวาดเนื้อหา)
-unit_key = st.session_state.get("unit_select", list(UNITS)[0])
+# เมนูเลือกตู้ (อยู่ด้านบนสุด)
+unit_key = st.selectbox(
+    "🔽 เลือกตู้/ห้องที่ต้องการบันทึกอุณหภูมิ",
+    options=list(UNITS),
+    format_func=lambda k: UNITS[k]["label"],
+    key="unit_select",
+)
 unit = UNITS[unit_key]
+st.divider()
 
 now = datetime.now(TZ)
 st.session_state.setdefault("month_sel", THAI_MONTHS[now.month - 1])
@@ -549,12 +555,4 @@ with tab_all:
             data=open(LOG_FILE, "rb").read(),
             file_name="temperature_log.csv", mime="text/csv",
         )
-
-# ======================= เลือกตู้ (บนสุด) =======================
-st.divider()
-st.selectbox(
-    "🔽 เลือกตู้/ห้องที่ต้องการบันทึกอุณหภูมิ",
-    options=list(UNITS),
-    format_func=lambda k: UNITS[k]["label"],
-    key="unit_select",
-)
+  
