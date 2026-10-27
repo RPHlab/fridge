@@ -379,7 +379,7 @@ def overview_chart(df):
 st.title("🌡️ ระบบบันทึกอุณหภูมิตู้เย็นและเช็คลิสต์")
 st.caption("โรงพยาบาลราชพฤกษ์ · FM-LAB-117 / 118 / 119 Rev.00")
 
-# ตู้ที่เลือก (selectbox อยู่ล่างสุดของหน้า แต่ค่าถูกอ่านจาก session_state ก่อนวาดเนื้อหา)
+# ตู้ที่เลือก (selectbox อยู่บนสุดของหน้า แต่ค่าถูกอ่านจาก session_state ก่อนวาดเนื้อหา)
 unit_key = st.session_state.get("unit_select", list(UNITS)[0])
 unit = UNITS[unit_key]
 
@@ -550,7 +550,7 @@ with tab_all:
             file_name="temperature_log.csv", mime="text/csv",
         )
 
-# ======================= เลือกตู้ (ล่างสุด) =======================
+# ======================= เลือกตู้ (บนสุด) =======================
 st.divider()
 st.selectbox(
     "🔽 เลือกตู้/ห้องที่ต้องการบันทึกอุณหภูมิ",
