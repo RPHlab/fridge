@@ -1,0 +1,560 @@
+import csv
+import os
+from datetime import datetime, timedelta, timezone
+
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from plotly.subplots import make_subplots
+
+st.set_page_config(page_title="ระบบบันทึกอุณหภูมิ", page_icon="🌡️", layout="wide")
+
+# ---------------------------------------------------------------------------
+# ค่าคงที่ทั่วไป
+# ---------------------------------------------------------------------------
+TZ = timezone(timedelta(hours=7))  # เวลาประเทศไทย
+DATA_DIR = "data"
+LOG_FILE = os.path.join(DATA_DIR, "temperature_log.csv")
+CA_FILE = os.path.join(DATA_DIR, "corrective_actions.csv")
+
+LOG_COLS = [
+    "timestamp", "date", "time", "form_date", "form_code", "unit_key",
+    "unit_name", "equipment_no", "month", "year", "slot", "slot_time",
+    "temperature", "status", "recorder", "checklist_done", "checklist_detail",
+]
+CA_COLS = [
+    "timestamp", "form_date", "form_code", "unit_key", "equipment_no",
+    "month", "year", "problem", "action",
+]
+
+THAI_MONTHS = [
+    "มกราคม", "กุมภาพันธ์", "มีนาคม", "เมษายน", "พฤษภาคม", "มิถุนายน",
+    "กรกฎาคม", "สิงหาคม", "กันยายน", "ตุลาคม", "พฤศจิกายน", "ธันวาคม",
+]
+
+# บันทึกช่วง "ดึก" (24.00-01.00) หลังเที่ยงคืน ให้นับเป็นของวันก่อนหน้า (เริ่มกะเมื่อวาน)
+# ถ้าหน่วยงานนับเป็นวันเดียวกับวันที่จริง ให้เปลี่ยนเป็น False
+NIGHT_SLOT_USES_PREVIOUS_DAY = True
+
+# ตำแหน่งจุดบนแกน X ภายในวัน (ช่อง ช/บ/ด ในแบบฟอร์ม)
+SLOT_X_OFFSET = {"ช": 0.0, "บ": 0.33, "ด": 0.66}
+
+DATA_LINE_COLOR = "#1f77b4"  # สีเส้นข้อมูลจริง (แบบฟอร์มไม่ได้กำหนด)
+LIMIT_COLOR = "red"          # สีเส้น Limit/Alert ตามแบบฟอร์ม
+
+# ---------------------------------------------------------------------------
+# โครงสร้างข้อมูลของแต่ละตู้/ห้อง (อ้างอิงจาก JSON ที่สกัดจากแบบฟอร์ม)
+# ---------------------------------------------------------------------------
+SLOTS_3 = [
+    {"code": "ช", "name": "เช้า", "label": "08.00-09.00", "start": 8 * 60, "end": 9 * 60},
+    {"code": "บ", "name": "บ่าย", "label": "16.00-17.00", "start": 16 * 60, "end": 17 * 60},
+    {"code": "ด", "name": "ดึก", "label": "24.00-01.00", "start": 0, "end": 60},
+]
+SLOTS_1 = [SLOTS_3[1]]
+
+OUT_OF_RANGE_STEPS = [
+    "ติดตามอุณหภูมิต่อไปอีก 2 ชั่วโมง",
+    "หากยังไม่กลับสู่ช่วงปกติ ติดต่อแผนกซ่อมบำรุง โทร. 1500",
+    "บันทึกการแก้ไขไว้ในตารางบันทึกการแก้ไข (ช่องของวันที่ตรวจสอบ)",
+]
+
+
+def base_checklist(limit_label, slots):
+    times = ", ".join(s["label"] for s in slots)
+    return [
+        f"บันทึกภายในช่วงเวลาที่กำหนด ({times} น.)",
+        f"อ่านค่าอุณหภูมิและเทียบกับช่วงมาตรฐาน ({limit_label})",
+        "ติ๊ก ( . ) ในช่องวันที่/ช่วงเวลา และลงชื่อผู้บันทึกในแบบฟอร์ม",
+    ]
+
+
+UNITS = {
+    "FM117_INCUBATOR": {
+        "label": "FM-LAB-117 · Incubator",
+        "short": "Incubator",
+        "form_code": "FM-LAB-117",
+        "title": "แบบบันทึกอุณหภูมิ Incubator",
+        "name_label": "ชื่อ/หมายเลขเครื่อง Incubator (ถ้ามี)",
+        "name_required": False,
+        "name_default": "Incubator",
+        "unit": "°C",
+        "min": 36.0, "max": 38.0, "max_strict": False,
+        "limit_label": "อุณหภูมิควบคุม 36-38 °C",
+        "y_min": 35, "y_max": 39, "y_step": 1,
+        "plot_bg": "#EFEDE0", "grid_x": "#555555", "grid_y": "#9EC5F2",
+        "slots": SLOTS_1,
+    },
+    "FM118_FRIDGE": {
+        "label": "FM-LAB-118 · ตู้เย็นเก็บโลหิต (1-6 °C)",
+        "short": "ตู้เย็นเก็บโลหิต",
+        "form_code": "FM-LAB-118",
+        "title": "แบบบันทึกอุณหภูมิตู้เย็นเก็บโลหิต",
+        "name_label": "หมายเลขเครื่อง (ตู้เย็นเก็บโลหิต)",
+        "name_required": True,
+        "name_default": "",
+        "unit": "°C",
+        "min": 1.0, "max": 6.0, "max_strict": False,
+        "limit_label": "อุณหภูมิตู้เย็น 1-6 องศาเซลเซียส",
+        "y_min": 0, "y_max": 10, "y_step": 1,
+        "plot_bg": "#FFFFFF", "grid_x": "#BBBBBB", "grid_y": "#BBBBBB",
+        "slots": SLOTS_3,
+    },
+    "FM118_FREEZER": {
+        "label": "FM-LAB-118 · ตู้แช่แข็ง (< -20 °C)",
+        "short": "ตู้แช่แข็ง",
+        "form_code": "FM-LAB-118",
+        "title": "แบบบันทึกอุณหภูมิตู้เย็นเก็บโลหิต (ตู้แช่แข็ง)",
+        "name_label": "หมายเลขเครื่อง (ตู้แช่แข็ง)",
+        "name_required": True,
+        "name_default": "",
+        "unit": "°C",
+        "min": None, "max": -20.0, "max_strict": True,  # < -20 (ไม่มีค่าต่ำสุด)
+        "limit_label": "อุณหภูมิตู้แช่แข็ง < -20 องศาเซลเซียส",
+        "y_min": -26, "y_max": -14, "y_step": 1,
+        "plot_bg": "#FFFFFF", "grid_x": "#BBBBBB", "grid_y": "#BBBBBB",
+        "slots": SLOTS_3,
+    },
+    "FM119_ROOM": {
+        "label": "FM-LAB-119 · อุณหภูมิห้อง (18-24 °C)",
+        "short": "อุณหภูมิห้อง",
+        "form_code": "FM-LAB-119",
+        "title": "แบบบันทึกอุณหภูมิห้อง",
+        "name_label": "ชื่อห้อง",
+        "name_required": True,
+        "name_default": "",
+        "unit": "°C",
+        "min": 18.0, "max": 24.0, "max_strict": False,
+        "limit_label": "อุณหภูมิห้อง 18-24 องศาเซลเซียส",
+        "y_min": 16, "y_max": 26, "y_step": 1,
+        "plot_bg": "#FFFFFF", "grid_x": "#BBBBBB", "grid_y": "#BBBBBB",
+        "slots": SLOTS_3,
+    },
+}
+for _u in UNITS.values():
+    _u["checklist"] = base_checklist(_u["limit_label"], _u["slots"])
+
+
+# ---------------------------------------------------------------------------
+# ฟังก์ชันช่วยเหลือ
+# ---------------------------------------------------------------------------
+def in_range(unit, temp):
+    """ตรวจว่าอุณหภูมิอยู่ในช่วงที่ยอมรับได้หรือไม่"""
+    if temp is None or pd.isna(temp):
+        return True
+    lo, hi = unit["min"], unit["max"]
+    if lo is not None and temp < lo:
+        return False
+    if hi is not None:
+        if unit["max_strict"] and temp >= hi:
+            return False
+        if not unit["max_strict"] and temp > hi:
+            return False
+    return True
+
+
+def limit_text(unit):
+    lo, hi = unit["min"], unit["max"]
+    if lo is None:
+        return f"< {hi:g} °C"
+    return f"{lo:g} - {hi:g} °C"
+
+
+def slot_by_code(unit, code):
+    return next(s for s in unit["slots"] if s["code"] == code)
+
+
+def suggest_slot(unit, now):
+    """เลือกช่วงเวลาที่ใกล้เวลาปัจจุบันที่สุด"""
+    m = now.hour * 60 + now.minute
+
+    def dist(s):
+        d = abs(m - s["start"])
+        return min(d, 1440 - d)
+
+    return min(unit["slots"], key=dist)["code"]
+
+
+def in_window(slot, t):
+    m = t.hour * 60 + t.minute
+    return slot["start"] <= m <= slot["end"]
+
+
+def append_csv(path, cols, row):
+    os.makedirs(DATA_DIR, exist_ok=True)
+    new_file = not os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        if new_file:
+            w.writeheader()
+        w.writerow({c: row.get(c, "") for c in cols})
+
+
+def load_log():
+    if not os.path.exists(LOG_FILE):
+        return pd.DataFrame(columns=LOG_COLS + ["day", "x", "out"])
+    df = pd.read_csv(LOG_FILE, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
+    df["form_date"] = pd.to_datetime(df["form_date"], errors="coerce")
+    df["month"] = pd.to_numeric(df["month"], errors="coerce")
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df = df.dropna(subset=["temperature", "form_date"]).copy()
+    df["day"] = df["form_date"].dt.day
+    df["x"] = df["day"] + df["slot"].map(SLOT_X_OFFSET).fillna(0.0)
+    df["out"] = df.apply(
+        lambda r: (not in_range(UNITS[r["unit_key"]], r["temperature"]))
+        if r["unit_key"] in UNITS else False,
+        axis=1,
+    )
+    return df.sort_values("x")
+
+
+def load_ca():
+    if not os.path.exists(CA_FILE):
+        return pd.DataFrame(columns=CA_COLS)
+    return pd.read_csv(CA_FILE, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+
+
+def eq_display(eq, unit):
+    return eq if eq else (unit["name_default"] or "-")
+
+
+# ---------------------------------------------------------------------------
+# Callback: บันทึกข้อมูล (ทำงานก่อน rerun จึงรีเซ็ตค่าในฟอร์มได้)
+# ---------------------------------------------------------------------------
+def save_record(unit_key):
+    ss = st.session_state
+    u = UNITS[unit_key]
+    temp = ss.get(f"temp_{unit_key}")
+    eq = (ss.get(f"eq_{unit_key}") or "").strip()
+    recorder = (ss.get(f"rec_{unit_key}") or "").strip()
+    month = THAI_MONTHS.index(ss["month_sel"]) + 1
+    year = int(ss["year_in"])
+
+    errors = []
+    if u["name_required"] and not eq:
+        errors.append(f"กรุณากรอก{u['name_label']}")
+    if temp is None:
+        errors.append("กรุณากรอกค่าอุณหภูมิ")
+    if not recorder:
+        errors.append("กรุณากรอกชื่อผู้บันทึก")
+    ok = in_range(u, temp) if temp is not None else True
+    problem = (ss.get(f"prob_{unit_key}") or "").strip()
+    action = (ss.get(f"act_{unit_key}") or "").strip()
+    if temp is not None and not ok and not problem:
+        errors.append("อุณหภูมิอยู่นอกช่วง กรุณากรอก 'ปัญหา' ในบันทึกการแก้ไข")
+    if errors:
+        ss["flash"] = ("error", " / ".join(errors))
+        return
+
+    now = datetime.now(TZ)
+    if ss.get(f"auto_{unit_key}", True):
+        d, t = now.date(), now.time().replace(second=0, microsecond=0)
+    else:
+        d, t = ss[f"date_{unit_key}"], ss[f"time_{unit_key}"]
+    slot = slot_by_code(u, ss[f"slot_{unit_key}"])
+
+    form_date = d
+    if NIGHT_SLOT_USES_PREVIOUS_DAY and slot["code"] == "ด" and t.hour < 12:
+        form_date = d - timedelta(days=1)
+
+    items = u["checklist"]
+    done = [bool(ss.get(f"chk_{unit_key}_{i}")) for i in range(len(items))]
+    detail = "; ".join(f"[{'/' if v else ' '}] {txt}" for v, txt in zip(done, items))
+    if not ok:
+        oor_done = [bool(ss.get(f"oor_{unit_key}_{i}")) for i in range(len(OUT_OF_RANGE_STEPS))]
+        detail += " | นอกช่วง: " + "; ".join(
+            f"[{'/' if v else ' '}] {txt}" for v, txt in zip(oor_done, OUT_OF_RANGE_STEPS)
+        )
+
+    ts = datetime.combine(d, t).strftime("%Y-%m-%d %H:%M:%S")
+    append_csv(LOG_FILE, LOG_COLS, {
+        "timestamp": ts,
+        "date": d.isoformat(),
+        "time": t.strftime("%H:%M"),
+        "form_date": form_date.isoformat(),
+        "form_code": u["form_code"],
+        "unit_key": unit_key,
+        "unit_name": u["short"],
+        "equipment_no": eq or u["name_default"],
+        "month": month,
+        "year": year,
+        "slot": slot["code"],
+        "slot_time": slot["label"],
+        "temperature": f"{temp:.1f}",
+        "status": "ปกติ" if ok else "นอกช่วง",
+        "recorder": recorder,
+        "checklist_done": f"{sum(done)}/{len(done)}",
+        "checklist_detail": detail,
+    })
+    if not ok:
+        append_csv(CA_FILE, CA_COLS, {
+            "timestamp": ts, "form_date": form_date.isoformat(),
+            "form_code": u["form_code"], "unit_key": unit_key,
+            "equipment_no": eq or u["name_default"], "month": month, "year": year,
+            "problem": problem, "action": action,
+        })
+
+    # รีเซ็ตฟอร์ม (คงชื่อเครื่อง/ผู้บันทึก/เดือน/ปีไว้)
+    ss[f"temp_{unit_key}"] = None
+    ss[f"prob_{unit_key}"] = ""
+    ss[f"act_{unit_key}"] = ""
+    for i in range(len(items)):
+        ss[f"chk_{unit_key}_{i}"] = False
+    for i in range(len(OUT_OF_RANGE_STEPS)):
+        ss[f"oor_{unit_key}_{i}"] = False
+    msg = f"บันทึกแล้ว: {u['short']} {eq or ''} = {temp:.1f} °C ({'ปกติ' if ok else 'นอกช่วง!'})"
+    ss["flash"] = ("success" if ok else "warning", msg)
+
+
+# ---------------------------------------------------------------------------
+# กราฟ
+# ---------------------------------------------------------------------------
+def add_unit_traces(fig, d, unit, rc=None, name_prefix=""):
+    """เพิ่มเส้นข้อมูล + เส้น Limit + กำหนดสเกลแกน Y ตามตู้"""
+    rc = rc or {}
+    for eq, g in d.groupby("equipment_no"):
+        fig.add_trace(go.Scatter(
+            x=g["x"], y=g["temperature"], mode="lines+markers",
+            name=f"{name_prefix}{eq_display(eq, unit)}",
+            line=dict(color=DATA_LINE_COLOR, width=2),
+            marker=dict(size=7),
+            customdata=g[["timestamp", "slot_time", "recorder"]].values,
+            hovertemplate=("%{y:.1f} °C<br>%{customdata[0]}<br>ช่วง %{customdata[1]}"
+                           "<br>ผู้บันทึก: %{customdata[2]}<extra></extra>"),
+        ), **rc)
+    bad = d[d["out"]]
+    if not bad.empty:
+        fig.add_trace(go.Scatter(
+            x=bad["x"], y=bad["temperature"], mode="markers",
+            name=f"{name_prefix}นอกช่วง",
+            marker=dict(color=LIMIT_COLOR, size=12, symbol="x"),
+            hoverinfo="skip",
+        ), **rc)
+
+    if unit["max"] is not None:
+        fig.add_hline(y=unit["max"], line=dict(color=LIMIT_COLOR, width=2),
+                      annotation_text=f"Max {unit['max']:g}", annotation_position="top left", **rc)
+    if unit["min"] is not None:
+        fig.add_hline(y=unit["min"], line=dict(color=LIMIT_COLOR, width=2),
+                      annotation_text=f"Min {unit['min']:g}", annotation_position="bottom left", **rc)
+
+    y_lo, y_hi = unit["y_min"], unit["y_max"]
+    if not d.empty:  # ขยายสเกลถ้ามีข้อมูลเกินกรอบของแบบฟอร์ม
+        y_lo = min(y_lo, d["temperature"].min() - 0.5)
+        y_hi = max(y_hi, d["temperature"].max() + 0.5)
+    fig.update_yaxes(range=[y_lo, y_hi], dtick=unit["y_step"], showgrid=True,
+                     gridcolor=unit["grid_y"], title_text="Temp (°C)", **rc)
+    fig.update_xaxes(range=[0.5, 31.5], dtick=1, showgrid=True,
+                     gridcolor=unit["grid_x"], title_text="วันที่", **rc)
+
+
+def single_chart(d, unit, title):
+    fig = go.Figure()
+    add_unit_traces(fig, d, unit)
+    fig.update_layout(
+        title=title, height=480, plot_bgcolor=unit["plot_bg"],
+        margin=dict(l=40, r=20, t=60, b=40),
+        legend=dict(orientation="h", y=-0.2),
+    )
+    return fig
+
+
+def overview_chart(df):
+    keys = list(UNITS)
+    fig = make_subplots(rows=2, cols=2, subplot_titles=[
+        f"{UNITS[k]['short']} ({limit_text(UNITS[k])})" for k in keys
+    ], vertical_spacing=0.18, horizontal_spacing=0.07)
+    for i, k in enumerate(keys):
+        r, c = i // 2 + 1, i % 2 + 1
+        add_unit_traces(fig, df[df["unit_key"] == k], UNITS[k],
+                        rc={"row": r, "col": c}, name_prefix=f"{UNITS[k]['short']}: ")
+    fig.update_layout(height=820, margin=dict(l=40, r=20, t=70, b=40),
+                      legend=dict(orientation="h", y=-0.08))
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# หน้าจอหลัก
+# ---------------------------------------------------------------------------
+st.title("🌡️ ระบบบันทึกอุณหภูมิตู้เย็นและเช็คลิสต์")
+st.caption("โรงพยาบาลราชพฤกษ์ · FM-LAB-117 / 118 / 119 Rev.00")
+
+# ตู้ที่เลือก (selectbox อยู่ล่างสุดของหน้า แต่ค่าถูกอ่านจาก session_state ก่อนวาดเนื้อหา)
+unit_key = st.session_state.get("unit_select", list(UNITS)[0])
+unit = UNITS[unit_key]
+
+now = datetime.now(TZ)
+st.session_state.setdefault("month_sel", THAI_MONTHS[now.month - 1])
+st.session_state.setdefault("year_in", now.year)
+
+if "flash" in st.session_state:
+    kind, msg = st.session_state.pop("flash")
+    getattr(st, kind)(msg)
+
+tab_rec, tab_all = st.tabs(["📝 บันทึก + เช็คลิสต์ + กราฟ", "📊 ภาพรวมทุกตู้"])
+
+# ======================= TAB 1 : บันทึก =======================
+with tab_rec:
+    st.subheader(unit["title"])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("แบบฟอร์ม", unit["form_code"])
+    c2.metric("ช่วงอุณหภูมิมาตรฐาน", limit_text(unit))
+    c3.metric("รอบบันทึก/วัน", f"{len(unit['slots'])} ครั้ง",
+              ", ".join(s["label"] for s in unit["slots"]))
+
+    left, right = st.columns([1, 1], gap="large")
+
+    # ---------- ฟอร์มกรอกข้อมูล ----------
+    with left:
+        st.markdown("#### ฟอร์มบันทึก")
+        st.text_input(unit["name_label"] + (" *" if unit["name_required"] else ""),
+                      value=unit["name_default"], key=f"eq_{unit_key}")
+        m1, m2 = st.columns(2)
+        m1.selectbox("เดือน", THAI_MONTHS, key="month_sel")
+        m2.number_input("ปี (ค.ศ.)", min_value=2000, max_value=2100, step=1, key="year_in")
+        m2.caption(f"พ.ศ. {int(st.session_state['year_in']) + 543}")
+
+        st.text_input("ผู้บันทึก *", key=f"rec_{unit_key}")
+
+        st.checkbox("ใช้วัน/เวลาปัจจุบัน (เวลาไทย)", value=True, key=f"auto_{unit_key}")
+        if st.session_state.get(f"auto_{unit_key}", True):
+            d_use, t_use = now.date(), now.time()
+            st.caption(f"วัน/เวลา: {now.strftime('%d/%m/%Y %H:%M')}")
+        else:
+            dd, tt = st.columns(2)
+            d_use = dd.date_input("วันที่", value=now.date(), key=f"date_{unit_key}")
+            t_use = tt.time_input("เวลา", value=now.time().replace(second=0, microsecond=0),
+                                  key=f"time_{unit_key}")
+
+        slot_codes = [s["code"] for s in unit["slots"]]
+        default_slot = suggest_slot(unit, datetime.combine(d_use, t_use))
+        st.session_state.setdefault(f"slot_{unit_key}", default_slot)
+        st.selectbox(
+            "ช่วงเวลาบันทึก", slot_codes, key=f"slot_{unit_key}",
+            format_func=lambda c: f"{c} ({slot_by_code(unit, c)['name']}) "
+                                  f"{slot_by_code(unit, c)['label']} น.",
+        )
+        slot_sel = slot_by_code(unit, st.session_state[f"slot_{unit_key}"])
+        if not in_window(slot_sel, t_use):
+            st.warning(f"เวลาที่เลือกอยู่นอกช่วงบันทึกที่กำหนด ({slot_sel['label']} น.)")
+
+        form_day = d_use
+        if NIGHT_SLOT_USES_PREVIOUS_DAY and slot_sel["code"] == "ด" and t_use.hour < 12:
+            form_day = d_use - timedelta(days=1)
+        sel_month = THAI_MONTHS.index(st.session_state["month_sel"]) + 1
+        if (form_day.month, form_day.year) != (sel_month, int(st.session_state["year_in"])):
+            st.warning(f"วันที่ในแบบฟอร์มคือ {form_day.strftime('%d/%m/%Y')} "
+                       "ไม่ตรงกับเดือน/ปีที่เลือก")
+
+        temp = st.number_input(
+            f"อุณหภูมิ (°C) *", min_value=-60.0, max_value=80.0, value=None, step=0.1,
+            format="%.1f", key=f"temp_{unit_key}", placeholder=f"มาตรฐาน {limit_text(unit)}",
+        )
+
+        out_of_range = temp is not None and not in_range(unit, temp)
+        if temp is not None:
+            if out_of_range:
+                st.error(f"⚠️ {temp:.1f} °C อยู่นอกช่วงมาตรฐาน ({limit_text(unit)})")
+            else:
+                st.success(f"✅ {temp:.1f} °C อยู่ในช่วงมาตรฐาน ({limit_text(unit)})")
+
+        st.markdown("#### เช็คลิสต์")
+        for i, item in enumerate(unit["checklist"]):
+            st.checkbox(item, key=f"chk_{unit_key}_{i}")
+
+        if out_of_range:
+            st.markdown("#### 🚨 กรณีอุณหภูมิไม่อยู่ในช่วงที่ยอมรับได้")
+            for i, step in enumerate(OUT_OF_RANGE_STEPS):
+                st.checkbox(step, key=f"oor_{unit_key}_{i}")
+            st.text_area("ปัญหา *", key=f"prob_{unit_key}", height=70)
+            st.text_area("ผลการแก้ไข", key=f"act_{unit_key}", height=70)
+
+        st.button("💾 บันทึก", type="primary", use_container_width=True,
+                  on_click=save_record, args=(unit_key,))
+
+    # ---------- กราฟย้อนหลัง ----------
+    with right:
+        st.markdown("#### กราฟอุณหภูมิย้อนหลัง")
+        df = load_log()
+        d_unit = df[df["unit_key"] == unit_key]
+        only_month = st.checkbox("แสดงเฉพาะเดือน/ปีที่เลือกในฟอร์ม", value=True, key="only_month")
+        if only_month:
+            d_unit = d_unit[(d_unit["month"] == sel_month) &
+                            (d_unit["year"] == int(st.session_state["year_in"]))]
+        eq_opts = sorted(d_unit["equipment_no"].unique())
+        eq_pick = st.multiselect("เครื่อง/ห้อง", eq_opts, default=eq_opts,
+                                 format_func=lambda e: eq_display(e, unit))
+        d_show = d_unit[d_unit["equipment_no"].isin(eq_pick)]
+        title = (f"{unit['short']} · {st.session_state['month_sel']} "
+                 f"{int(st.session_state['year_in'])}" if only_month else unit["short"])
+        st.plotly_chart(single_chart(d_show, unit, title), use_container_width=True)
+        if d_show.empty:
+            st.info("ยังไม่มีข้อมูลในช่วงที่เลือก")
+        else:
+            n_out = int(d_show["out"].sum())
+            st.caption(f"จำนวนบันทึก {len(d_show)} ครั้ง · นอกช่วง {n_out} ครั้ง")
+
+    # ---------- ตารางบันทึกการแก้ไข ----------
+    st.markdown("#### บันทึกการแก้ไขเมื่ออุณหภูมิไม่อยู่ในช่วงที่ยอมรับได้")
+    ca = load_ca()
+    ca = ca[ca["unit_key"] == unit_key]
+    if only_month:
+        ca = ca[(ca["month"] == str(sel_month)) & (ca["year"] == str(int(st.session_state["year_in"])))]
+    log = pd.DataFrame({
+        "วันที่": pd.to_datetime(ca["form_date"], errors="coerce").dt.strftime("%d/%m/%Y"),
+        "เครื่อง/ห้อง": ca["equipment_no"],
+        "ปัญหา": ca["problem"],
+        "ผลการแก้ไข": ca["action"],
+    }).reset_index(drop=True)
+    blank = max(0, 3 - len(log))  # แบบฟอร์มมี 3 แถวว่างเป็นอย่างน้อย
+    if blank:
+        log = pd.concat([log, pd.DataFrame([{c: "" for c in log.columns}] * blank)],
+                        ignore_index=True)
+    st.dataframe(log, use_container_width=True, hide_index=True)
+
+# ======================= TAB 2 : ภาพรวม =======================
+with tab_all:
+    st.subheader("เปรียบเทียบกราฟอุณหภูมิทุกตู้ในหน้าเดียว")
+    df_all = load_log()
+    if df_all.empty:
+        st.info("ยังไม่มีข้อมูล กรุณาบันทึกอุณหภูมิก่อน")
+    else:
+        periods = (df_all[["year", "month"]].drop_duplicates()
+                   .sort_values(["year", "month"], ascending=False).values.tolist())
+        labels = {f"{THAI_MONTHS[int(m) - 1]} {int(y)}": (int(y), int(m)) for y, m in periods}
+        options = ["ทุกช่วงเวลา"] + list(labels)
+        cur = f"{st.session_state['month_sel']} {int(st.session_state['year_in'])}"
+        pick = st.selectbox("ช่วงเวลา", options, index=options.index(cur) if cur in labels else 0)
+        d_all = df_all if pick == "ทุกช่วงเวลา" else df_all[
+            (df_all["year"] == labels[pick][0]) & (df_all["month"] == labels[pick][1])]
+
+        st.plotly_chart(overview_chart(d_all), use_container_width=True)
+
+        rows = []
+        for k, u in UNITS.items():
+            g = d_all[d_all["unit_key"] == k]
+            last = g.sort_values("timestamp").iloc[-1] if not g.empty else None
+            rows.append({
+                "ตู้/ห้อง": u["label"],
+                "ช่วงมาตรฐาน": limit_text(u),
+                "จำนวนบันทึก": len(g),
+                "นอกช่วง": int(g["out"].sum()) if not g.empty else 0,
+                "ล่าสุด (°C)": f"{last['temperature']:.1f}" if last is not None else "-",
+                "เวลาล่าสุด": last["timestamp"] if last is not None else "-",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "⬇️ ดาวน์โหลดข้อมูลทั้งหมด (CSV)",
+            data=open(LOG_FILE, "rb").read(),
+            file_name="temperature_log.csv", mime="text/csv",
+        )
+
+# ======================= เลือกตู้ (ล่างสุด) =======================
+st.divider()
+st.selectbox(
+    "🔽 เลือกตู้/ห้องที่ต้องการบันทึกอุณหภูมิ",
+    options=list(UNITS),
+    format_func=lambda k: UNITS[k]["label"],
+    key="unit_select",
+)
